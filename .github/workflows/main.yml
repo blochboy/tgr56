@@ -1,0 +1,129 @@
+name: Server 24x7
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  server:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OWNER_JID: ${{ secrets.OWNER_JID }}
+      SESSION_DIR: C:/wa-session
+      HANDOFF_AFTER_MIN: 320
+    steps:
+      - name: Install tools
+        shell: pwsh
+        run: choco install rclone ollama cloudflared -y --no-progress
+
+      - name: Screen link (VNC + noVNC + Cloudflare)
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $vncArgs = "SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
+          choco install tightvnc -y --no-progress "--install-arguments=$vncArgs"
+          python -m pip install websockify
+          Invoke-WebRequest https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.zip -OutFile C:/novnc.zip
+          Expand-Archive C:/novnc.zip C:/novnc -Force
+          Start-Process python -ArgumentList '-m websockify --web C:/novnc/noVNC-1.5.0 6080 127.0.0.1:5900' -WindowStyle Hidden
+          Start-Process cloudflared -ArgumentList 'tunnel --url http://localhost:6080 --logfile C:/cf.log' -WindowStyle Hidden
+          $url = $null
+          for ($i=0; $i -lt 30 -and -not $url; $i++) {
+            Start-Sleep 2
+            if (Test-Path C:/cf.log) {
+              $m = Select-String -Path C:/cf.log -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' | Select-Object -First 1
+              if ($m) { $url = $m.Matches[0].Value }
+            }
+          }
+          "SCREEN_URL=$url/vnc.html?autoconnect=1&resize=scale" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+
+      - name: Connect Google Drive
+        shell: pwsh
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          New-Item -ItemType Directory -Force "$env:APPDATA/rclone" | Out-Null
+          Set-Content "$env:APPDATA/rclone/rclone.conf" $env:RCLONE_CONF
+          rclone lsd gdrive:
+          if ($LASTEXITCODE -ne 0) { throw 'RCLONE_CONF galat hai: usme [gdrive] section hona chahiye' }
+          rclone mkdir gdrive:handoff
+          rclone mkdir gdrive:wa-session
+
+      - name: Mount Drive as G (optional)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          Start-Process rclone -ArgumentList 'mount gdrive: G: --vfs-cache-mode full' -WindowStyle Hidden
+
+      - name: Wait for previous machine to hand over
+        shell: pwsh
+        run: |
+          $files = @(rclone lsf gdrive:handoff --files-only)
+          if ($files -contains 'active.txt') {
+            for ($i=0; $i -lt 60; $i++) {
+              $files = @(rclone lsf gdrive:handoff --files-only)
+              if ($files -contains 'ready.txt') { break }
+              Start-Sleep 10
+            }
+          }
+          rclone delete gdrive:handoff --include ready.txt
+          Set-Content "$env:TEMP/active.txt" (Get-Date -Format o)
+          rclone copyto "$env:TEMP/active.txt" gdrive:handoff/active.txt
+
+      - name: Start Ollama
+        shell: pwsh
+        run: |
+          Start-Process ollama -ArgumentList 'serve' -WindowStyle Hidden
+          Start-Sleep 8
+          ollama pull qwen2.5-coder:7b
+
+      - name: Start WhatsApp bot and tell owner
+        shell: pwsh
+        env:
+          BOT_REPO: ${{ secrets.BOT_REPO }}
+        run: |
+          git clone $env:BOT_REPO C:/bot
+          Set-Location C:/bot
+          npm install --no-audit --no-fund
+          npm install @whiskeysockets/baileys --no-audit --no-fund
+          rclone copy gdrive:wa-session $env:SESSION_DIR
+          $notify = @'
+          const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+          (async () => {
+            const { state, saveCreds } = await useMultiFileAuthState(process.env.SESSION_DIR);
+            const sock = makeWASocket({ auth: state });
+            sock.ev.on('creds.update', saveCreds);
+            sock.ev.on('connection.update', async ({ connection }) => {
+              if (connection === 'open') {
+                await sock.sendMessage(process.env.OWNER_JID, { text: process.argv[2] });
+                setTimeout(() => process.exit(0), 3000);
+              }
+            });
+          })();
+          '@
+          Set-Content C:/bot/notify.js $notify
+          node notify.js "Nayi machine taiyar hai. Screen link: $env:SCREEN_URL"
+          $bot = Start-Process node -ArgumentList 'index.js' -WorkingDirectory C:/bot -WindowStyle Hidden -PassThru
+          Set-Content C:/bot.pid $bot.Id
+
+      # UI-TARS: yahan apna screen-control agent start karein (alag se test karna hoga)
+
+      - name: Stay alive, then hand off
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds ([int]$env:HANDOFF_AFTER_MIN * 60)
+          gh workflow run server.yml --repo $env:GITHUB_REPOSITORY
+          Stop-Process -Id ([int](Get-Content C:/bot.pid)) -Force -ErrorAction SilentlyContinue
+          Start-Sleep 5
+          rclone copy $env:SESSION_DIR gdrive:wa-session
+          Set-Location C:/bot
+          node notify.js 'Kuch minute mein nayi machine taiyar hogi, bot thodi der band rahega.'
+          rclone copy $env:SESSION_DIR gdrive:wa-session
+          Set-Content "$env:TEMP/ready.txt" (Get-Date -Format o)
+          rclone copyto "$env:TEMP/ready.txt" gdrive:handoff/ready.txt
+          Start-Sleep 240
